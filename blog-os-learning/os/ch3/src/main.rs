@@ -102,9 +102,11 @@ extern "C" fn rust_main() -> ! {
     // 使用轮转调度算法（Round-Robin），依次执行各任务
     let mut remain = index_mod; // 剩余未完成的任务数
     let mut i = 0usize; // 当前任务索引
+    log::info!("Starting scheduler: {index_mod} tasks, remain={remain}");
     while remain > 0 {
         *CURRENT_TASK_IDX.lock() = i;
         let tcb = &mut TCBS.lock()[i];
+        log::debug!("scheduler: i={i}, remain={remain}, finish={}", tcb.finish);
         if !tcb.finish {
             loop {
                 // 【抢占式调度】设置时钟中断：12500 个时钟周期后触发
@@ -130,13 +132,16 @@ extern "C" fn rust_main() -> ! {
                     // ─── 系统调用：用户程序执行了 ecall 指令 ───
                     Trap::Exception(Exception::UserEnvCall) => {
                         use task::SchedulingEvent as Event;
-                        let result = tcb.handle_syscall();
-                        match result.event {
+                        match tcb.handle_syscall() {
                             // 普通系统调用（如 write）：处理完成后继续运行当前任务
                             Event::None => continue,
                             // exit 系统调用：任务主动退出
                             Event::Exit(code) => {
                                 log::info!("app{i} exit with code {code}");
+                                log::debug!(
+                                    "app{i} will set finish=true, remain going from {remain} to {}",
+                                    remain - 1
+                                );
                                 true
                             }
                             // yield 系统调用：任务主动让出 CPU
@@ -165,11 +170,17 @@ extern "C" fn rust_main() -> ! {
 
                 // 如果任务结束（退出或被杀死），标记为已完成
                 if finish {
+                    log::debug!(
+                        "setting finish=true for app{i}, remain {remain} -> {}",
+                        remain - 1
+                    );
                     tcb.finish = true;
                     remain -= 1;
                 }
                 break;
             }
+        } else {
+            log::debug!("app{i} already finished, skipping");
         }
         // 轮转到下一个任务（循环取模）
         i = (i + 1) % index_mod;
@@ -192,7 +203,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 /// 各依赖库所需接口的具体实现
 mod impls {
-    use crate::{CURRENT_TASK_IDX, TCBS};
+    // CURRENT_TASK_IDX and TCBS are no longer needed here
     use tg_console::log;
     use tg_syscall::*;
 
@@ -303,12 +314,10 @@ mod impls {
                     0
                 }
                 2 => {
-                    // 查询系统调用计数
-                    let idx = *CURRENT_TASK_IDX.lock();
-                    log::trace!("trace count: idx={}, syscall_id={}", idx, id);
-                    let count = TCBS.lock()[idx].syscall_counts[id] as isize;
-                    log::trace!("trace count result = {}", count);
-                    count
+                    // 查询系统调用计数 - 注意：此功能已在 task.rs 的 handle_syscall 中处理
+                    // 此处返回 -1 表示未实现
+                    log::trace!("trace count: this should be handled in task.rs");
+                    -1
                 }
                 _ => -1,
             }

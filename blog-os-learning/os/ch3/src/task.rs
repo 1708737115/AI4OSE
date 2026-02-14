@@ -8,6 +8,12 @@
 //! 第二章的批处理系统中，用户上下文直接在 `rust_main` 的局部变量中管理。
 //! 本章将其封装到 `TaskControlBlock` 中，每个任务拥有独立的 TCB，
 //! 包含用户上下文、完成状态和独立的用户栈，支持多任务并发。
+//!
+//! 教程阅读建议：
+//!
+//! - 先看 `TaskControlBlock` 字段：理解“上下文 + 栈 + 状态位”最小任务模型；
+//! - 再看 `handle_syscall`：理解系统调用结果如何映射成调度事件；
+//! - 最后对照 `ch3/src/main.rs`：把“事件生成”和“事件消费”串成闭环。
 
 use tg_kernel_context::LocalContext;
 use tg_syscall::{Caller, SyscallId};
@@ -18,6 +24,7 @@ use tg_syscall::{Caller, SyscallId};
 /// - `ctx`：用户态上下文（所有通用寄存器 + 控制寄存器），用于任务切换时保存/恢复状态
 /// - `finish`：任务是否已完成（退出或被杀死）
 /// - `stack`：用户栈空间（8 KiB），每个任务有独立的栈
+/// - `syscall_counts`：系统调用计数数组，用于 trace 功能
 pub struct TaskControlBlock {
     /// 用户态上下文：保存 Trap 时的所有寄存器状态
     ctx: LocalContext,
@@ -26,8 +33,8 @@ pub struct TaskControlBlock {
     /// 用户栈：8 KiB（1024 个 usize = 1024 × 8 = 8192 字节）
     /// 每个任务拥有独立的栈空间，避免栈溢出影响其他任务
     stack: [usize; 1024],
-    // 统计对系统调用的调用次数（可选）
-    pub syscall_counts: [usize; 1024],
+    /// 系统调用计数数组，索引为系统调用号，值为调用次数
+    pub syscall_counts: [usize; 512],
 }
 
 /// 调度事件
@@ -45,18 +52,13 @@ pub enum SchedulingEvent {
     UnsupportedSyscall(SyscallId),
 }
 
-/// handle_syscall 的返回值，包含调度事件和系统调用 ID
-pub struct SyscallResult {
-    pub event: SchedulingEvent,
-}
-
 impl TaskControlBlock {
     /// 零值常量：用于数组初始化
     pub const ZERO: Self = Self {
         ctx: LocalContext::empty(),
         finish: false,
         stack: [0; 1024],
-        syscall_counts: [0; 1024],
+        syscall_counts: [0; 512],
     };
 
     /// 初始化一个任务
@@ -64,9 +66,11 @@ impl TaskControlBlock {
     /// - 清零用户栈
     /// - 创建用户态上下文，设置入口地址和 `sstatus.SPP = User`
     /// - 将栈指针设置为用户栈的栈顶（高地址端）
+    /// - 清零系统调用计数
     pub fn init(&mut self, entry: usize) {
         self.stack.fill(0);
         self.finish = false;
+        self.syscall_counts.fill(0);
         self.ctx = LocalContext::user(entry);
         // 栈从高地址向低地址增长，所以 sp 指向栈顶（数组末尾之后的地址）
         *self.ctx.sp_mut() = self.stack.as_ptr() as usize + core::mem::size_of_val(&self.stack);
@@ -81,12 +85,12 @@ impl TaskControlBlock {
         unsafe { self.ctx.execute() };
     }
 
-    /// 处理系统调用，返回调度事件和系统调用ID
+    /// 处理系统调用，返回调度事件
     ///
     /// 从用户上下文中提取系统调用 ID（a7 寄存器）和参数（a0-a5 寄存器），
     /// 分发到对应的处理函数，并将返回值写回 a0 寄存器。
-    /// 在内部统计系统调用次数。
-    pub fn handle_syscall(&mut self) -> SyscallResult {
+    /// 同时统计系统调用次数。
+    pub fn handle_syscall(&mut self) -> SchedulingEvent {
         use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
         use SchedulingEvent as Event;
 
@@ -94,8 +98,10 @@ impl TaskControlBlock {
         let id: SyscallId = self.ctx.a(7).into();
         let syscall_id = id.0 as usize;
 
-        // 统计系统调用次数（在调用 tg_syscall::handle 之前！）
-        self.syscall_counts[syscall_id] += 1;
+        // 统计系统调用次数
+        if syscall_id < self.syscall_counts.len() {
+            self.syscall_counts[syscall_id] += 1;
+        }
 
         // a0-a5 寄存器存放系统调用参数
         let args = [
@@ -106,7 +112,33 @@ impl TaskControlBlock {
             self.ctx.a(4),
             self.ctx.a(5),
         ];
-        let event = match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
+
+        // 处理 trace 系统调用（ID 410）
+        if let Id::TRACE = id {
+            let trace_request = args[0];
+            let trace_id = args[1];
+            let trace_data = args[2];
+            let ret = match trace_request {
+                0 => unsafe { *(trace_id as *const u8) as isize },
+                1 => {
+                    unsafe { *(trace_id as *mut u8) = trace_data as u8 };
+                    0
+                }
+                2 => {
+                    if trace_id < self.syscall_counts.len() {
+                        self.syscall_counts[trace_id] as isize
+                    } else {
+                        -1
+                    }
+                }
+                _ => -1,
+            };
+            *self.ctx.a_mut(0) = ret as _;
+            self.ctx.move_next();
+            return Event::None;
+        }
+
+        match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
             Ret::Done(ret) => match id {
                 // exit 系统调用：返回退出事件
                 Id::EXIT => Event::Exit(self.ctx.a(0)),
@@ -125,8 +157,6 @@ impl TaskControlBlock {
             },
             // 不支持的系统调用
             Ret::Unsupported(_) => Event::UnsupportedSyscall(id),
-        };
-
-        SyscallResult { event }
+        }
     }
 }

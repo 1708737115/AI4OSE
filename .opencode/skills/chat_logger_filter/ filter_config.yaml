@@ -1,0 +1,36 @@
+# 对话过滤配置文件
+min_content_length: 10
+enable_auto_filter: true
+enable_logging: true
+
+# 保留关键词（RCore场景核心）
+reserved_keywords:
+  - "怎么"
+  - "如何"
+  - "为什么"
+  - "帮我"
+  - "请"
+  - "创建"
+  - "修改"
+  - "panic"
+  - "fault"
+  - "报错"
+  - "cargo"
+  - "rustc"
+  - "QEMU"
+  - "系统调用"
+
+# 过滤关键词
+filter_keywords:
+  - "谢谢"
+  - "收到"
+  - "好的"
+  - "OK"
+  - "辛苦了"
+  - "不错"
+  - "在吗"
+  - "人呢"
+
+# 路径配置
+log_directory: "/home/fengxu/mylib/AI-Native OS/AI4OSE/blog-os-learning/chat_conversion"
+log_file: "/home/fengxu/mylib/AI-Native OS/AI4OSE/blog-os-learning/chat_conversion"
